@@ -1,0 +1,207 @@
+# %% [markdown]
+# GEOG 761 — Data Prep: Summer Composites (Waitematā AOI) + Optional Polygon Labels
+# - AOI: your provided polygon
+# - Sensors: 1999–2002 L7; 2003–2012 L5; 2013–2025 L8
+# - Months: Dec 1 (prev year) → Mar 1 (year)
+# - Cloud/shadow/snow/cirrus masking via QA_PIXEL (C2 L2)
+# - Scaling: reflectance = DN * 0.0000275 - 0.2 (clamped to [0,1])
+# - Export: Google Drive → "GEOG 761_proj_training/composites"
+# - Optional: rasterize training polygons (class_id ∈ {1..5}) aligned to composites
+
+# %% [code]
+import ee
+
+# Authenticate/initialize (uncomment ee.Authenticate() the first time in a new environment)
+try:
+    ee.Initialize()
+except Exception:
+    ee.Authenticate()      # follow the URL if prompted
+    ee.Initialize()
+
+# -----------------------------
+# 1) PARAMETERS
+# -----------------------------
+# AOI: Waitematā Harbour inlet polygon (WGS84 lon/lat)
+AOI = ee.Geometry.Polygon(
+    [[[174.72943333664927, -36.78566558579557],
+      [174.72943333664927, -36.82937187071147],
+      [174.79260472336802, -36.82937187071147],
+      [174.79260472336802, -36.78566558579557]]],
+    None, False
+)
+
+START_SUMMER = 1999    # first 'summer end year' to export (Dec 1, 1998 → Mar 1, 1999)
+END_SUMMER   = 2025    # last  'summer end year' to export (Dec 1, 2024 → Mar 1, 2025)
+
+EXPORT_FOLDER = 'GEOG 761_proj_training/composites'   # Google Drive folder
+EXPORT_PREFIX = 'waitemata_summer'                    # fileNamePrefix
+EXPORT_SCALE  = 30                                    # meters
+EXPORT_CRS    = 'EPSG:32760'                          # UTM Zone 60S (NZ north)
+
+# Optional training polygons (upload to GEE Assets and set ID + class field)
+USE_POLYGONS            = True    # set False to skip
+TRAIN_POLYGONS_ASSET_ID = 'users/yourname/geog761_training_polygons'  # <-- change to your asset
+TRAIN_CLASS_FIELD       = 'class_id'  # integer codes: 1..5
+LABELS_SUBFOLDER        = 'GEOG 761_proj_training/labels'  # Drive subfolder for label rasters
+
+
+# -----------------------------
+# 2) UTILITIES: scaling + masking + renaming
+# -----------------------------
+def scale_sr_c2(img):
+    """Apply C2L2 reflectance scale/offset and clamp to [0,1]."""
+    scaled = img.select('SR_B.*').multiply(0.0000275).add(-0.2).clamp(0, 1)
+    return img.addBands(scaled, overwrite=True).select(scaled.bandNames())
+
+def mask_landsat_sr_c2(img, is_l8=False):
+    """
+    Cloud/shadow/snow/cirrus mask using QA_PIXEL (C2L2) + remove saturated pixels (QA_RADSAT>0).
+    Bits (QA_PIXEL): 0=fill, 1=dilated cloud, 2=cirrus(L8/9), 3=cloud, 4=cloud shadow, 5=snow.
+    """
+    qa = img.select('QA_PIXEL')
+    mask = qa.bitwiseAnd(1 << 0).eq(0)   # not fill
+    mask = mask.And(qa.bitwiseAnd(1 << 1).eq(0))   # not dilated cloud
+    mask = mask.And(qa.bitwiseAnd(1 << 3).eq(0))   # not cloud
+    mask = mask.And(qa.bitwiseAnd(1 << 4).eq(0))   # not cloud shadow
+    mask = mask.And(qa.bitwiseAnd(1 << 5).eq(0))   # not snow
+    if is_l8:
+        mask = mask.And(qa.bitwiseAnd(1 << 2).eq(0))  # not cirrus (L8/9 only)
+
+    # Drop radiometrically saturated pixels
+    rad = img.select('QA_RADSAT')
+    mask = mask.And(rad.eq(0))
+
+    return img.updateMask(mask)
+
+BANDS_STD = ['Blue','Green','Red','NIR','SWIR1','SWIR2']
+
+def rename_to_common_bands(img, sensor):
+    """
+    Map sensor-specific SR bands to a common 6-band set:
+    Blue, Green, Red, NIR, SWIR1, SWIR2
+    """
+    if sensor == 'L8':
+        return img.select(
+            ['SR_B2','SR_B3','SR_B4','SR_B5','SR_B6','SR_B7'],
+            BANDS_STD
+        )
+    else:  # L5/L7
+        return img.select(
+            ['SR_B1','SR_B2','SR_B3','SR_B4','SR_B5','SR_B7'],
+            BANDS_STD
+        )
+
+def prep_image(img, sensor):
+    """Scale → mask → rename → clip."""
+    is_l8 = (sensor == 'L8')
+    return (scale_sr_c2(img)
+            .pipe(mask_landsat_sr_c2, is_l8=is_l8)
+            .pipe(rename_to_common_bands, sensor=sensor))
+
+
+# -----------------------------
+# 3) COLLECTION PICKER BY SEASON
+# -----------------------------
+def summer_dates(year_end):
+    """Return (start, end) ISO dates for Dec 1 (year_end-1) → Mar 1 (year_end)."""
+    start = ee.Date.fromYMD(year_end-1, 12, 1)
+    end   = ee.Date.fromYMD(year_end,     3, 1)
+    return start, end
+
+def collection_for_summer(year_end):
+    """Return (collection, sensor_tag) for the requested summer."""
+    start, end = summer_dates(year_end)
+    if year_end <= 2002:
+        col = ee.ImageCollection('LANDSAT/LE07/C02/T1_L2')  # L7 SR (pre-SLC-off era)
+        tag = 'L7'
+    elif year_end <= 2012:
+        col = ee.ImageCollection('LANDSAT/LT05/C02/T1_L2')  # L5 SR (avoid L7 stripes)
+        tag = 'L5'
+    else:
+        col = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2')  # L8 SR
+        tag = 'L8'
+    col = (col
+           .filterDate(start, end)
+           .filterBounds(AOI))
+    return col, tag
+
+def build_summer_composite(year_end):
+    """Prepare median summer composite with common 6 bands; returns (image, count)."""
+    col, tag = collection_for_summer(year_end)
+    prepped = col.map(lambda im: prep_image(im, tag).clip(AOI))
+    count   = prepped.size()
+    # Handle empty collections gracefully
+    img = ee.Image(prepped.median()).set({
+        'year_end': year_end,
+        'sensor': tag,
+        'count': count
+    })
+    return img, count
+
+
+# -----------------------------
+# 4) EXPORT HELPERS
+# -----------------------------
+def export_composite(img, year_end):
+    desc  = f'{EXPORT_PREFIX}_{year_end}_SR'
+    fname = f'{EXPORT_PREFIX}_{year_end}_SR'
+    task = ee.batch.Export.image.toDrive(
+        image=img,
+        description=desc,
+        folder=EXPORT_FOLDER,
+        fileNamePrefix=fname,
+        region=AOI,
+        crs=EXPORT_CRS,
+        scale=EXPORT_SCALE,
+        maxPixels=1e13
+    )
+    task.start()
+    print(f'Export started: {desc}')
+
+def export_labels_from_polygons(polys_fc, year_end):
+    """
+    Rasterize polygon labels to align with composites.
+    - polys_fc: FeatureCollection with integer field TRAIN_CLASS_FIELD ∈ {1..5}
+    - writes uint8 GeoTIFF with same region/CRS/scale as composites
+    """
+    label = (polys_fc
+             .reduceToImage(properties=[TRAIN_CLASS_FIELD], reducer=ee.Reducer.mode())
+             .toUint8()
+             .clip(AOI)
+             .rename('label')
+             .unmask(0))  # background=0 (ignored)
+    desc  = f'{EXPORT_PREFIX}_{year_end}_LABELS'
+    fname = f'{EXPORT_PREFIX}_{year_end}_LABELS'
+    task = ee.batch.Export.image.toDrive(
+        image=label,
+        description=desc,
+        folder=LABELS_SUBFOLDER,
+        fileNamePrefix=fname,
+        region=AOI,
+        crs=EXPORT_CRS,
+        scale=EXPORT_SCALE,
+        maxPixels=1e13
+    )
+    task.start()
+    print(f'Export started: {desc}')
+
+
+# -----------------------------
+# 5) RUN: loop years and export
+# -----------------------------
+for yr in range(START_SUMMER, END_SUMMER + 1):
+    img, n = build_summer_composite(yr)
+    n_local = n.getInfo()
+    if n_local == 0:
+        print(f'[SKIP] {yr}: no images in date window.')
+        continue
+    # Order bands for consistency
+    img = img.select(BANDS_STD)
+    export_composite(img, yr)
+
+    if USE_POLYGONS:
+        try:
+            polys = ee.FeatureCollection(TRAIN_POLYGONS_ASSET_ID)
+            export_labels_from_polygons(polys, yr)
+        except Exception as e:
+            print(f'[LABELS SKIPPED] {yr}: {e}')
